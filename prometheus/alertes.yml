@@ -109,15 +109,36 @@ groups:
           resume: "{{ $labels.name }} a gagné {{ $value }} processus en 2 h — enfants non récupérés ?"
 
       - alert: ConteneurDisparu
-        # Liste des conteneurs considérés comme critiques, tous projets
-        # confondus. C'est le SEUL endroit de la stack à tenir à jour quand un
-        # projet arrive ou part du VPS — tout le reste est auto-découvert.
-        expr: absent_over_time(container_last_seen{name=~"ustdy-prod-.*|ustudyguide-prod-web|aitalkmentor_.*"}[5m])
-        for: 5m
+        # Aucune liste à tenir : la règle compare l'ensemble des conteneurs
+        # établis à ceux vus maintenant, et sort la différence. Un projet
+        # déployé aujourd'hui est couvert dès qu'il a deux heures de vol.
+        #
+        # count_over_time(...[6h] offset 10m) > 240 : ne retient que les
+        # conteneurs ayant au moins 2 h de présence (240 points à 30 s de
+        # scrape) dans les 6 h précédentes. Ce filtre écarte l'éphémère —
+        # migrations, tâches cron, conteneurs de build — dont la disparition
+        # est normale et ne doit pas réveiller qui que ce soit.
+        #
+        # for: 10m : un redéploiement recrée le conteneur sous le même nom en
+        # bien moins de dix minutes ; la clause `unless` redevient vraie avant
+        # l'échéance et la règle ne se déclenche pas.
+        #
+        # La règle se referme d'elle-même ~4 h après la disparition, quand le
+        # conteneur sort de la fenêtre de 6 h : un retrait volontaire finit par
+        # s'éteindre sans intervention.
+        expr: |
+          count by (name, container_label_com_docker_compose_project) (
+            count_over_time(container_last_seen{name!=""}[6h] offset 10m) > 240
+          )
+          unless
+          count by (name, container_label_com_docker_compose_project) (
+            container_last_seen{name!=""}
+          )
+        for: 10m
         labels:
           severite: critique
         annotations:
-          resume: "Un conteneur critique n'émet plus de métriques depuis 5 min"
+          resume: "{{ $labels.name }} ({{ $labels.container_label_com_docker_compose_project }}) n'émet plus de métriques"
 
   # ─────────────────────────────────────────────
   # Santé de la collecte elle-même

@@ -13,7 +13,18 @@ services:
   # Métriques PAR CONTENEUR (CPU, RAM, réseau, nb de processus)
   # ─────────────────────────────────────────────
   cadvisor:
-    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    # v0.55.0 minimum, et ghcr.io plutôt que gcr.io : ce registre ne publie plus
+    # rien au-delà de v0.55.1.
+    #
+    # Docker ≥ 28 active l'image store containerd par défaut, et `docker info`
+    # annonce alors le storage driver « overlayfs ». Les cAdvisor antérieurs
+    # cherchent le layout historique /var/lib/docker/image/<driver>/layerdb/
+    # pour résoudre la couche read-write ; ce répertoire n'existe pas avec le
+    # snapshotter, la création du handler échoue pour CHAQUE conteneur et plus
+    # aucune série container_* n'est produite. La panne est silencieuse : la
+    # cible Prometheus reste « up » et sert un /metrics sans conteneurs.
+    # Correctif upstream : PR google/cadvisor#3709, publiée en v0.55.0.
+    image: ghcr.io/google/cadvisor:v0.60.5
     container_name: monitoring-cadvisor
     restart: unless-stopped
     privileged: true

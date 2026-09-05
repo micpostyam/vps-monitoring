@@ -28,11 +28,12 @@ consommation réelle attendue autour de 550–700 Mo au repos.
 Aucun `ports:` n'est publié. Seul Grafana sort, via Traefik ; les trois autres
 services ne sont joignables que sur le réseau `monitoring_internal`.
 
-**Rien n'est à déclarer par projet** : cAdvisor découvre tous les conteneurs du
-démon Docker. Les étiquettes `com.docker.compose.project` et `.service` sont
-conservées, ce qui permet de filtrer et de regrouper par projet dans Grafana.
-Le seul endroit qui nomme des conteneurs est l'alerte `ConteneurDisparu`, à
-mettre à jour quand un projet critique arrive ou part du VPS.
+**Rien n'est à déclarer par projet, nulle part** : cAdvisor découvre tous les
+conteneurs du démon Docker. Les étiquettes `com.docker.compose.project` et
+`.service` sont conservées, ce qui permet de filtrer et de regrouper par projet
+dans Grafana. Les dashboards et les alertes se peuplent seuls — aucun fichier de
+ce dépôt ne nomme un conteneur ou un projet. Un projet déployé demain est
+surveillé sans que rien ne soit touché ici.
 
 ## Installation
 
@@ -135,12 +136,40 @@ echo | openssl s_client -connect monitor.ustudyguide.com:443 \
 # issuer doit mentionner Let's Encrypt, jamais TRAEFIK DEFAULT CERT
 ```
 
+La deuxième commande doit renvoyer la liste des projets Compose du VPS. Si elle
+renvoie `{"status":"success","data":[]}` **alors que la cible `cadvisor` est
+`up`**, cAdvisor n'arrive à instancier aucun conteneur :
+
+```bash
+docker compose logs cadvisor | grep 'Failed to create existing container' | head -3
+# → "failed to identify the read-write layer ID" = image cAdvisor trop ancienne
+#   pour l'image store containerd (storage driver « overlayfs »). Voir le
+#   commentaire du service cadvisor dans docker-compose.yml.
+docker info --format 'Storage Driver: {{.Driver}}'   # overlayfs vs overlay2
+```
+
+C'est le second réglage qui se trompe en silence : la cible reste `up`, aucun
+scrape n'échoue, et seuls les graphes restent vides.
+
+Attention aussi : `docker compose ps` est **scopé au projet du répertoire
+courant**. Lancé depuis `/opt/monitoring`, il n'affiche que les quatre
+conteneurs de la stack, même si vingt autres tournent à côté. Pour voir ce que
+cAdvisor est censé découvrir :
+
+```bash
+docker ps --format 'table {{.Names}}\t{{.Label "com.docker.compose.project"}}'
+```
+
 Puis ouvrir le domaine → basicauth → login Grafana (`admin`).
 
-## Le dashboard
+## Les dashboards
 
-`UStudyGuide / VPS — Ressources & conteneurs`, provisionné automatiquement, avec
-une variable **Projet** en haut pour isoler un projet ou tout afficher.
+Deux dashboards, provisionnés automatiquement dans le dossier `UStudyGuide`.
+
+### `VPS — Ressources & conteneurs`
+
+Le dashboard général, avec une variable **Projet** en haut pour isoler un projet
+ou tout afficher. Sa liste se remplit seule à partir des étiquettes Compose.
 
 Quatre panneaux portent le diagnostic :
 
@@ -152,6 +181,17 @@ Quatre panneaux portent le diagnostic :
   (`usg_ges_ets/apps/notes/pdf_utils.py:124`).
 - **Croissance mémoire sur 24 h** — classement par mémoire *gagnée*. Une charge
   normale revient à zéro, une fuite reste positive jour après jour.
+
+### `Staging — tous environnements`
+
+Même lecture, restreinte à tout conteneur dont le **projet Compose ou le nom**
+contient `staging` (`ustdy_staging`, `aitalkmentor-staging`, …). Le filtre est un
+motif, pas une liste : un environnement de staging déployé demain y apparaît
+seul, à condition de respecter cette convention de nommage.
+
+Il répond à la question « combien le staging coûte-t-il à la machine ? » — le
+panneau *Part de la RAM du VPS* passe à l'orange au-delà de 30 %, moment où le
+staging commence à concurrencer la production sur un VPS partagé.
 
 Dashboards communautaires en complément (Grafana → Import par ID, nécessite un
 accès Internet sortant) : **193** (Docker/cAdvisor), **1860** (Node Exporter Full).
@@ -170,7 +210,23 @@ docker compose exec prometheus wget -qO- localhost:9090/api/v1/rules
 
 **Hôte** — RAM > 85 % / 95 %, swap > 25 %, CPU > 80 %, disque < 15 %.
 **Conteneurs** — > 85 % de sa limite, crashloop, prolifération de processus,
-conteneur critique disparu, cible de scrape injoignable.
+conteneur disparu, cible de scrape injoignable.
+
+`ConteneurDisparu` ne contient **aucune liste** : elle compare l'ensemble des
+conteneurs établis à ceux vus maintenant et sort la différence. « Établi » = au
+moins 2 h de présence dans les 6 h précédentes, ce qui écarte les migrations et
+les tâches cron, dont la disparition est normale. Le `for: 10m` absorbe les
+redéploiements. Un projet arrivé sur le VPS est donc couvert dès qu'il a deux
+heures de vol, sans rien éditer ici.
+
+C'est la seule règle dont le comportement n'est pas lisible à l'œil ; elle est
+couverte par des tests unitaires (disparition réelle, tâche éphémère,
+redéploiement, projet inconnu du dépôt) :
+
+```bash
+docker run --rm -v "$PWD/prometheus:/p:ro" --entrypoint promtool \
+  prom/prometheus:v2.55.1 test rules /p/alertes_test.yml
+```
 
 `FuiteMemoireProbable` est la règle qui aurait attrapé le problème avant le
 redémarrage : elle extrapole la tendance des 6 dernières heures sur 24 h et se

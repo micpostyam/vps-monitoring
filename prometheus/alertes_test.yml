@@ -1,0 +1,81 @@
+# Tests unitaires des règles d'alerte.
+#
+#   docker run --rm -v "$PWD/prometheus:/p:ro" --entrypoint promtool \
+#     prom/prometheus:v2.55.1 test rules /p/alertes_test.yml
+#
+# Ils portent sur ConteneurDisparu, la seule règle dont le comportement n'est
+# pas lisible à l'œil : elle doit attraper un conteneur établi qui s'en va,
+# sans crier sur un redéploiement ni sur une tâche éphémère.
+rule_files:
+  - alertes.yml
+
+evaluation_interval: 30s
+
+tests:
+  # ── 1. Un conteneur établi disparaît → doit alerter ──────────────
+  - interval: 30s
+    input_series:
+      # Présent en continu de t=0 à t=7h, puis plus rien.
+      - series: 'container_last_seen{name="ustdy-prod-web",container_label_com_docker_compose_project="ustdy_production"}'
+        values: "1+0x840"
+    alert_rule_test:
+      # À 7h10, l'expression vient de devenir vraie (5 min de lookback) :
+      # `for: 10m` n'est pas atteint, la règle est pending, pas firing.
+      - eval_time: 7h10m
+        alertname: ConteneurDisparu
+        exp_alerts: []
+      # À 7h20, les 10 min sont écoulées : l'alerte part.
+      - eval_time: 7h20m
+        alertname: ConteneurDisparu
+        exp_alerts:
+          - exp_labels:
+              severite: critique
+              name: ustdy-prod-web
+              container_label_com_docker_compose_project: ustdy_production
+            exp_annotations:
+              resume: "ustdy-prod-web (ustdy_production) n'émet plus de métriques"
+
+  # ── 2. Un conteneur éphémère disparaît → silence ─────────────────
+  - interval: 30s
+    input_series:
+      # Une migration qui tourne 10 min puis se termine normalement.
+      - series: 'container_last_seen{name="ustdy-prod-migrate",container_label_com_docker_compose_project="ustdy_production"}'
+        values: "1+0x20"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: ConteneurDisparu
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: ConteneurDisparu
+        exp_alerts: []
+
+  # ── 3. Un redéploiement (coupure 8 min) → silence ────────────────
+  - interval: 30s
+    input_series:
+      # Présent 7h, absent 8 min (recréation sous le même nom), puis revient.
+      - series: 'container_last_seen{name="aitalkmentor-prod-backend",container_label_com_docker_compose_project="aitalkmentor-prod"}'
+        values: "1+0x840 _x16 1+0x120"
+    alert_rule_test:
+      - eval_time: 7h20m
+        alertname: ConteneurDisparu
+        exp_alerts: []
+      - eval_time: 8h
+        alertname: ConteneurDisparu
+        exp_alerts: []
+
+  # ── 4. Un projet déployé aujourd'hui est couvert sans rien déclarer ──
+  - interval: 30s
+    input_series:
+      # Projet inconnu du dépôt, apparu il y a 3h, disparu à t=3h.
+      - series: 'container_last_seen{name="prepcertif-web-1",container_label_com_docker_compose_project="prepcertif"}'
+        values: "1+0x360"
+    alert_rule_test:
+      - eval_time: 3h20m
+        alertname: ConteneurDisparu
+        exp_alerts:
+          - exp_labels:
+              severite: critique
+              name: prepcertif-web-1
+              container_label_com_docker_compose_project: prepcertif
+            exp_annotations:
+              resume: "prepcertif-web-1 (prepcertif) n'émet plus de métriques"
