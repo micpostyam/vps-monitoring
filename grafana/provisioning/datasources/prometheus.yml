@@ -1,0 +1,14 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # Doit rester aligné sur scrape_interval : Grafana s'en sert pour choisir
+      # le pas des requêtes et éviter les trous dans les graphes.
+      timeInterval: 30s

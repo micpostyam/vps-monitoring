@@ -1,0 +1,133 @@
+# Règles d'alerte, valables pour tous les projets du VPS. Elles s'affichent
+# dans Prometheus (/alerts) et sont interrogeables depuis Grafana via la
+# métrique ALERTS — voir le README pour brancher les notifications.
+#
+# Les règles portant sur les conteneurs ne nomment aucun projet : cAdvisor les
+# découvre tous. Seule ConteneurDisparu, plus bas, liste explicitement ce qui
+# est considéré comme critique.
+groups:
+  # ─────────────────────────────────────────────
+  # Santé de l'hôte
+  # ─────────────────────────────────────────────
+  - name: hote
+    rules:
+      - alert: MemoireHoteElevee
+        expr: (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 > 85
+        for: 10m
+        labels:
+          severite: avertissement
+        annotations:
+          resume: "RAM de l'hôte à {{ $value | printf \"%.0f\" }} % depuis 10 min"
+
+      - alert: MemoireHoteCritique
+        expr: (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 > 95
+        for: 5m
+        labels:
+          severite: critique
+        annotations:
+          resume: "RAM de l'hôte à {{ $value | printf \"%.0f\" }} % — OOM kill imminent"
+
+      - alert: SwapActif
+        # Sur un VPS, un swap qui se remplit précède de peu l'effondrement des
+        # temps de réponse. C'est un signal plus précoce que le CPU.
+        expr: (node_memory_SwapTotal_bytes - node_memory_SwapFree_bytes) / node_memory_SwapTotal_bytes * 100 > 25
+        for: 15m
+        labels:
+          severite: avertissement
+        annotations:
+          resume: "Swap utilisé à {{ $value | printf \"%.0f\" }} %"
+
+      - alert: CpuHoteEleve
+        expr: 100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 15m
+        labels:
+          severite: avertissement
+        annotations:
+          resume: "CPU de l'hôte à {{ $value | printf \"%.0f\" }} % depuis 15 min"
+
+      - alert: DisqueBientotPlein
+        expr: node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"} * 100 < 15
+        for: 30m
+        labels:
+          severite: avertissement
+        annotations:
+          resume: "Plus que {{ $value | printf \"%.0f\" }} % d'espace libre sur /"
+
+  # ─────────────────────────────────────────────
+  # Santé des conteneurs — le cœur du diagnostic
+  # ─────────────────────────────────────────────
+  - name: conteneurs
+    rules:
+      - alert: ConteneurProcheDeSaLimite
+        # Nécessite les deploy.resources.limits posés sur les stacks : sans
+        # limite, container_spec_memory_limit_bytes vaut 0 et la règle ne se
+        # déclenche jamais.
+        expr: |
+          container_memory_working_set_bytes{name!=""}
+            / container_spec_memory_limit_bytes{name!=""} * 100 > 85
+          and container_spec_memory_limit_bytes{name!=""} > 0
+        for: 10m
+        labels:
+          severite: avertissement
+        annotations:
+          resume: "{{ $labels.name }} occupe {{ $value | printf \"%.0f\" }} % de sa limite mémoire"
+
+      - alert: ConteneurEnBoucleDeRedemarrage
+        # Le symptôme exact d'un crashloop : plusieurs démarrages en 15 min.
+        # C'est l'une des hypothèses du pic observé avant le reboot.
+        expr: changes(container_start_time_seconds{name!=""}[15m]) > 2
+        for: 5m
+        labels:
+          severite: critique
+        annotations:
+          resume: "{{ $labels.name }} a redémarré {{ $value }} fois en 15 min"
+
+      - alert: FuiteMemoireProbable
+        # Détecteur de dérive lente : extrapole la tendance des 6 dernières
+        # heures sur les 24 h à venir. Si la projection dépasse la limite du
+        # conteneur, la consommation monte sans redescendre — une fuite, pas
+        # une charge. C'est la règle qui aurait attrapé le problème avant reboot.
+        expr: |
+          predict_linear(container_memory_working_set_bytes{name!=""}[6h], 24 * 3600)
+            > container_spec_memory_limit_bytes{name!=""}
+          and container_spec_memory_limit_bytes{name!=""} > 0
+        for: 1h
+        labels:
+          severite: avertissement
+        annotations:
+          resume: "{{ $labels.name }} atteindra sa limite mémoire sous 24 h au rythme actuel"
+
+      - alert: ProliferationDeProcessus
+        # Un conteneur applicatif a un nombre de processus stable (gunicorn et
+        # celery sont en préfork). Une croissance continue signale des enfants
+        # non récupérés — typiquement un Chromium Playwright jamais fermé.
+        expr: delta(container_processes{name!=""}[2h]) > 10
+        for: 30m
+        labels:
+          severite: avertissement
+        annotations:
+          resume: "{{ $labels.name }} a gagné {{ $value }} processus en 2 h — enfants non récupérés ?"
+
+      - alert: ConteneurDisparu
+        # Liste des conteneurs considérés comme critiques, tous projets
+        # confondus. C'est le SEUL endroit de la stack à tenir à jour quand un
+        # projet arrive ou part du VPS — tout le reste est auto-découvert.
+        expr: absent_over_time(container_last_seen{name=~"ustdy-prod-.*|ustudyguide-prod-web|aitalkmentor_.*"}[5m])
+        for: 5m
+        labels:
+          severite: critique
+        annotations:
+          resume: "Un conteneur critique n'émet plus de métriques depuis 5 min"
+
+  # ─────────────────────────────────────────────
+  # Santé de la collecte elle-même
+  # ─────────────────────────────────────────────
+  - name: supervision
+    rules:
+      - alert: CibleInjoignable
+        expr: up == 0
+        for: 10m
+        labels:
+          severite: avertissement
+        annotations:
+          resume: "La cible {{ $labels.job }} ne répond plus depuis 10 min"

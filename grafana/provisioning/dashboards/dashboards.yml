@@ -1,0 +1,16 @@
+apiVersion: 1
+
+providers:
+  - name: ustudyguide
+    orgId: 1
+    folder: UStudyGuide
+    type: file
+    disableDeletion: false
+    # Les dashboards sont montés en lecture seule depuis le dépôt : toute
+    # modification faite dans l'UI est écrasée au redémarrage. Pour garder une
+    # personnalisation, l'exporter en JSON et la committer dans grafana/dashboards/.
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

@@ -1,0 +1,34 @@
+# Configuration Prometheus du VPS (tous projets).
+# Intervalle à 30s : suffisant pour une fuite qui se dessine sur des heures,
+# et trois fois moins de points à stocker qu'un scrape à 10s.
+global:
+  scrape_interval: 30s
+  scrape_timeout: 10s
+  evaluation_interval: 30s
+  external_labels:
+    serveur: vps-principal
+
+rule_files:
+  - /etc/prometheus/alertes.yml
+
+scrape_configs:
+  # Métriques par conteneur : CPU, RAM, réseau, nombre de processus.
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["cadvisor:8080"]
+    metric_relabel_configs:
+      # cAdvisor produit une série par conteneur ET une par cgroup système.
+      # On ne garde que les conteneurs nommés : ~90 % de séries en moins.
+      - source_labels: [name]
+        regex: "^$"
+        action: drop
+
+  # Métriques de l'hôte : RAM totale, load, disque, I/O.
+  - job_name: node
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  # Prometheus se surveille lui-même (utile pour repérer un scrape qui traîne).
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

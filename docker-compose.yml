@@ -1,0 +1,160 @@
+name: monitoring
+
+# Observabilité du VPS, tous projets confondus.
+#
+# La stack est volontairement agnostique : cAdvisor découvre tout seul chaque
+# conteneur du démon Docker, quel que soit le projet auquel il appartient
+# (ustdy, ustudyguide, aitalkmentor…). Aucune liste à tenir à jour ici.
+#
+# Aucun port n'est publié : seul Grafana sort, via Traefik. Prometheus,
+# cAdvisor et node-exporter ne sont joignables que sur le réseau interne.
+services:
+  # ─────────────────────────────────────────────
+  # Métriques PAR CONTENEUR (CPU, RAM, réseau, nb de processus)
+  # ─────────────────────────────────────────────
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: monitoring-cadvisor
+    restart: unless-stopped
+    privileged: true
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    command:
+      # cAdvisor est le poste le plus gourmand de la stack en réglages par
+      # défaut. Ces quatre options divisent son empreinte par ~3 sans rien
+      # retirer de ce qu'on veut mesurer.
+      - --housekeeping_interval=30s
+      - --docker_only=true
+      - --store_container_labels=false
+      # Seules ces deux étiquettes sont conservées : elles suffisent à
+      # regrouper les métriques par projet Compose dans Grafana, sans
+      # ramener la centaine de labels que Docker pose sur chaque conteneur.
+      - --whitelisted_container_labels=com.docker.compose.project,com.docker.compose.service
+      - --disable_metrics=percpu,sched,tcp,udp,advtcp,hugetlb,referenced_memory,cpu_topology,resctrl
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+          cpus: "0.50"
+
+  # ─────────────────────────────────────────────
+  # Métriques de l'HÔTE (RAM totale, load, disque, I/O)
+  # ─────────────────────────────────────────────
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: monitoring-node-exporter
+    restart: unless-stopped
+    pid: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/rootfs
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|rootfs/var/lib/docker/containers|rootfs/var/lib/docker/overlay2)($$|/)
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
+
+  # ─────────────────────────────────────────────
+  # Stockage des séries temporelles + règles d'alerte
+  # ─────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: monitoring-prometheus
+    restart: unless-stopped
+    user: "65534:65534"
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 30 jours : il faut plusieurs semaines pour qu'une fuite lente se
+      # détache du bruit. La borne en taille protège le disque du VPS.
+      - --storage.tsdb.retention.time=30d
+      - --storage.tsdb.retention.size=4GB
+      - --web.enable-lifecycle
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+          cpus: "1.0"
+
+  # ─────────────────────────────────────────────
+  # Dashboards — seul service exposé publiquement
+  # ─────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana-oss:11.4.0
+    container_name: monitoring-grafana
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      GF_SERVER_ROOT_URL: https://${MONITORING_DOMAIN}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    networks:
+      - internal
+    labels:
+      - "traefik.enable=true"
+      # Le resolver dépend de la zone DNS du domaine choisi :
+      #   - zone chez Cloudflare (ex. *.ustdy.com) → letsencrypt-dns
+      #   - toute autre zone (ex. ustudyguide.com, chez LWS) → letsencrypt (HTTP-01)
+      # Un routeur pointé sur le mauvais resolver n'échoue pas visiblement :
+      # Traefik sert son certificat auto-signé TRAEFIK DEFAULT CERT.
+      - "traefik.http.routers.monitoring.rule=Host(`${MONITORING_DOMAIN}`)"
+      # priority élevée : le routeur de production ustdy capte
+      # HostRegexp(`[a-z0-9-]+\.ustdy\.com`) avec priority=10. Sans priorité
+      # supérieure, un domaine de monitoring sur cette zone lui serait avalé.
+      - "traefik.http.routers.monitoring.priority=200"
+      - "traefik.http.routers.monitoring.entrypoints=websecure"
+      - "traefik.http.routers.monitoring.tls.certresolver=${MONITORING_CERT_RESOLVER}"
+      - "traefik.http.routers.monitoring.middlewares=monitoring-auth"
+      - "traefik.http.services.monitoring.loadbalancer.server.port=3000"
+      - "traefik.docker.network=monitoring_internal"
+      # Deuxième barrière devant le login Grafana. Hash généré par htpasswd,
+      # les $ doublés — voir README.
+      - "traefik.http.middlewares.monitoring-auth.basicauth.users=${MONITORING_BASIC_AUTH}"
+      # Redirection HTTP → HTTPS. L'entrypoint web doit rester joignable de
+      # l'extérieur si le resolver utilise le challenge HTTP-01.
+      - "traefik.http.routers.monitoring-http.rule=Host(`${MONITORING_DOMAIN}`)"
+      - "traefik.http.routers.monitoring-http.priority=200"
+      - "traefik.http.routers.monitoring-http.entrypoints=web"
+      - "traefik.http.routers.monitoring-http.middlewares=monitoring-redirect-to-https"
+      - "traefik.http.middlewares.monitoring-redirect-to-https.redirectscheme.scheme=https"
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+          cpus: "0.50"
+
+volumes:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  internal:
+    driver: bridge
